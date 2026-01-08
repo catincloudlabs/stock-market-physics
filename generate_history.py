@@ -7,12 +7,15 @@ from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from supabase import create_client, Client, ClientOptions
 from tenacity import retry, stop_after_attempt, wait_exponential
+import httpx
 
 # 1. SETUP
 load_dotenv()
 
-# INCREASE TIMEOUT: Give the DB more time to think (60 seconds)
+# FIX: Explicitly increase timeouts for the HTTP client
+timeout_config = httpx.Timeout(60.0, connect=10.0, read=60.0)
 opts = ClientOptions(postgrest_client_timeout=60)
+
 supabase: Client = create_client(
     os.getenv("SUPABASE_URL"), 
     os.getenv("SUPABASE_SERVICE_KEY"),
@@ -28,11 +31,11 @@ PERPLEXITY = 30
 def fetch_daily_vectors_rpc(target_date):
     """
     Fetches daily averages using Server-Side Paging.
-    This prevents timeouts by fetching 100 tickers at a time.
+    Page size reduced to 25 to ensure rapid response times.
     """
     all_records = []
     page = 0
-    page_size = 100
+    page_size = 25 # Smaller chunks to prevent socket hangs
     
     while True:
         try:
@@ -50,6 +53,7 @@ def fetch_daily_vectors_rpc(target_date):
             # Process this batch
             for item in resp.data:
                 vec = item['vector']
+                # Handle different return formats (string vs list)
                 if isinstance(vec, str):
                     vec = json.loads(vec)
                 
