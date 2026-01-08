@@ -21,76 +21,76 @@ PERPLEXITY = 30
 def fetch_daily_vectors_safe(target_date):
     """
     Fetches news vectors for a specific date and averages them by ticker.
-    Includes BATCHING to prevent URL overflow errors on large datasets.
+    Refactored to fetch IDs first, then fetch data in small chunks to avoid
+    timeouts on large payloads.
     """
     start = f"{target_date} 00:00:00"
     end = f"{target_date} 23:59:59"
     
-    # A. Get News Vectors (IDs are Integers)
-    # This usually returns fine even with large ranges
-    news_resp = supabase.table("news_vectors") \
-        .select("id, embedding") \
+    # 1. Get ONLY IDs for the day (Fast, lightweight)
+    # This avoids downloading 50MB+ of vectors in one go.
+    ids_resp = supabase.table("news_vectors") \
+        .select("id") \
         .gte("published_at", start) \
         .lte("published_at", end) \
         .execute()
         
-    if not news_resp.data:
+    if not ids_resp.data:
         return None
         
-    # Map: Integer ID -> Vector
-    news_map_int = {item['id']: np.array(item['embedding']) for item in news_resp.data}
-    
-    # Convert Integers to Strings for Graph Query
-    news_ids_str = [str(nid) for nid in news_map_int.keys()]
-    
-    if not news_ids_str:
+    all_ids = [item['id'] for item in ids_resp.data]
+    if not all_ids:
         return None
-
-    # B. Get Edges (News -> Ticker) - BATCHED
-    # We chunk the IDs to avoid "URI Too Long" errors / Socket timeouts
-    BATCH_SIZE = 50 
-    all_edges = []
     
-    # Iterate in chunks
-    for i in range(0, len(news_ids_str), BATCH_SIZE):
-        batch_ids = news_ids_str[i : i + BATCH_SIZE]
+    # 2. Process in manageable chunks (e.g., 100 articles at a time)
+    CHUNK_SIZE = 100
+    ticker_vectors = {} # {ticker: [list of vectors]}
+    
+    # Iterate through the IDs in batches
+    for i in range(0, len(all_ids), CHUNK_SIZE):
+        chunk_ids = all_ids[i : i + CHUNK_SIZE]
         
         try:
-            # Supabase 'in_' filter works best with smaller lists
+            # A. Fetch Embeddings for this small chunk
+            vec_resp = supabase.table("news_vectors") \
+                .select("id, embedding") \
+                .in_("id", chunk_ids) \
+                .execute()
+                
+            if not vec_resp.data: continue
+            
+            # Map ID -> Vector
+            temp_map = {item['id']: np.array(item['embedding']) for item in vec_resp.data}
+            
+            # B. Fetch Edges for this small chunk
+            # Note: knowledge_graph uses string source_ids
+            chunk_ids_str = [str(uid) for uid in chunk_ids]
+            
             edges_resp = supabase.table("knowledge_graph") \
                 .select("source_node, target_node") \
-                .in_("source_node", batch_ids) \
+                .in_("source_node", chunk_ids_str) \
                 .eq("edge_type", "MENTIONS") \
                 .execute()
             
+            # C. Aggregate immediately to save memory
             if edges_resp.data:
-                all_edges.extend(edges_resp.data)
-                
+                for edge in edges_resp.data:
+                    ticker = edge['target_node']
+                    # source_node is string, convert to int for lookup
+                    try:
+                        src_id = int(edge['source_node'])
+                        if src_id in temp_map:
+                            if ticker not in ticker_vectors:
+                                ticker_vectors[ticker] = []
+                            ticker_vectors[ticker].append(temp_map[src_id])
+                    except ValueError:
+                        continue
+                        
         except Exception as e:
-            print(f"    ⚠️ Batch fetch error (skipping chunk): {e}")
+            print(f"    ⚠️ Chunk error {i}-{i+CHUNK_SIZE}: {e}")
             continue
 
-    if not all_edges:
-        return None
-
-    # C. Aggregate Vectors by Ticker
-    ticker_vectors = {}
-    
-    for edge in all_edges:
-        ticker = edge['target_node']
-        source_id_str = edge['source_node'] # This is a string from DB
-        
-        # Convert string back to int to look up the vector
-        try:
-            source_id_int = int(source_id_str)
-            if source_id_int in news_map_int:
-                if ticker not in ticker_vectors:
-                    ticker_vectors[ticker] = []
-                ticker_vectors[ticker].append(news_map_int[source_id_int])
-        except ValueError:
-            continue
-    
-    # D. Average them (Centroid)
+    # 3. Final Averaging (Centroid Calculation)
     final_data = []
     for ticker, vectors in ticker_vectors.items():
         if len(vectors) > 0:
