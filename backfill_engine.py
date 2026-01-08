@@ -21,7 +21,7 @@ BACKFILL_DAYS = 30
 MAX_WORKERS = 10 
 DB_BATCH_SIZE = 200
 
-# (Reuse your TICKER_UNIVERSE from the main script)
+# The Curated Universe (242 Tickers)
 TICKER_UNIVERSE = [
     "AAPL", "NVDA", "MSFT", "GOOGL", "AMZN", "META", "TSLA", "BRK.B", "LLY", "AVGO", "JPM",
     "AMD", "QCOM", "TXN", "INTC", "AMAT", "MU", "LRCX", "ADI", "KLAC", "MRVL", "SNPS", 
@@ -51,18 +51,16 @@ TICKER_UNIVERSE = [
 
 # --- ROBUST UTILS ---
 
+# FIX 1: Retry Logic for OpenAI Network Errors
 @retry(wait=wait_random_exponential(min=1, max=60), stop=stop_after_attempt(6))
 def get_embedding(text):
-    """
-    Retries OpenAI calls automatically if they fail or timeout.
-    """
     text = text.replace("\n", " ")
     return openai_client.embeddings.create(input=[text], model="text-embedding-3-small").data[0].embedding
 
 def upload_stock_batch(records):
     if not records: return
     try:
-        # FIX: Added ignore_duplicates and on_conflict to handle existing data gracefully
+        # FIX 2: Ignore duplicates to prevent DB crashes
         supabase.table("stocks_ohlc").upsert(
             records, 
             on_conflict="ticker,date", 
@@ -70,7 +68,7 @@ def upload_stock_batch(records):
         ).execute()
         print(f" 💾 Saved {len(records)} rows to DB.")
     except Exception as e:
-        # We print but don't crash the script
+        # Log error but don't crash
         print(f" ❌ DB Error (Batch Skipped): {str(e)[:100]}...")
 
 # --- PART 1: OPTIMIZED STOCK HISTORY (AGGREGATES) ---
@@ -134,7 +132,7 @@ def backfill_news():
             
             print(f"  ... fetched page of {len(articles)} articles. Processing...")
             
-            # Process in sub-batches of 10 to save progress incrementally
+            # Process in small sub-batches to save progress
             sub_batch_size = 10
             for i in range(0, len(articles), sub_batch_size):
                 chunk = articles[i:i + sub_batch_size]
@@ -149,7 +147,7 @@ def backfill_news():
                     if len(text_content) < 20: continue
                     
                     try:
-                        vector = get_embedding(text_content) # Now robust!
+                        vector = get_embedding(text_content) 
                         
                         news_item = {
                             "ticker": "MARKET",
@@ -160,17 +158,11 @@ def backfill_news():
                             "related_tickers": article.get("tickers", []) 
                         }
                         
-                        # Upload News (Get ID)
                         res = supabase.table("news_vectors").upsert(
                             {k:v for k,v in news_item.items() if k!="related_tickers"}, 
                             on_conflict="url",
-                            ignore_duplicates=True # Avoid crashing on re-runs
+                            ignore_duplicates=True
                         ).execute()
-                        
-                        # Get ID (Either from insert or existing query - simplistic here)
-                        # Note: upsert return data might be empty if ignore_duplicates=True and row exists.
-                        # For robustness in backfill, we skip edge creation if we can't get ID easily,
-                        # OR we perform a separate select.
                         
                         if res.data:
                             news_id = res.data[0]['id']
@@ -183,11 +175,8 @@ def backfill_news():
                                 })
                                 
                     except Exception as e:
-                        # Log but don't stop the whole batch
-                        # print(f"Skipped article: {e}") 
-                        pass
+                        pass # Skip bad articles
 
-                # Upload Edges
                 if batch_edges:
                     try:
                         supabase.table("knowledge_graph").upsert(
@@ -196,7 +185,6 @@ def backfill_news():
                     except Exception as e:
                         pass
                 
-                # Small breathing room
                 print(f"    - Saved chunk {i}-{i+len(chunk)}")
                 time.sleep(0.1)
 
