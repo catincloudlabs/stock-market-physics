@@ -1,0 +1,36 @@
+# Python / Airflow
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.airflow/
+logs/
+*.log
+
+# Environment / secrets
+.env
+.env.*
+*.key
+*.pem
+*.p8
+*.der
+*.pub
+keys/
+dbt/profiles.yml
+
+# OS / Editor junk
+.DS_Store
+Thumbs.db
+.vscode/
+.venv/
+.idea/
+
+# Build / cache (via Cloudflare)
+dist/
+build/
+node_modules
+*.egg-info/
+
+# scratch paper for notes
+scratch.txt
+scratch.json
