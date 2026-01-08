@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from supabase import create_client, Client
 from openai import OpenAI
-from tenacity import retry, wait_random_exponential, stop_after_attempt
+from tenacity import retry, wait_random_exponential, stop_after_attempt, retry_if_exception_type
 
 # 1. SETUP
 load_dotenv()
@@ -60,7 +60,7 @@ def get_embedding(text):
 def upload_stock_batch(records):
     if not records: return
     try:
-        # FIX 2: Ignore duplicates to prevent DB crashes
+        # Ignore duplicates for Stocks is safe because we don't need the returned ID
         supabase.table("stocks_ohlc").upsert(
             records, 
             on_conflict="ticker,date", 
@@ -68,44 +68,44 @@ def upload_stock_batch(records):
         ).execute()
         print(f" 💾 Saved {len(records)} rows to DB.")
     except Exception as e:
-        # Log error but don't crash
         print(f" ❌ DB Error (Batch Skipped): {str(e)[:100]}...")
 
 # --- PART 1: OPTIMIZED STOCK HISTORY (AGGREGATES) ---
 
+# FIX 2: Use Decorator for Retry instead of dangerous recursion
+@retry(stop=stop_after_attempt(5), wait=wait_random_exponential(min=1, max=10))
 def fetch_ticker_history(ticker):
     end_date = datetime.now().strftime('%Y-%m-%d')
     start_date = (datetime.now() - timedelta(days=BACKFILL_DAYS)).strftime('%Y-%m-%d')
     
     url = f"{POLYGON_BASE_URL}/v2/aggs/ticker/{ticker}/range/1/day/{start_date}/{end_date}?adjusted=true&sort=asc&apiKey={MASSIVE_KEY}"
     
-    try:
-        resp = requests.get(url, timeout=15)
-        if resp.status_code == 429:
-            print(f" ⏳ Rate limit on {ticker}. Sleeping...")
-            time.sleep(2)
-            return fetch_ticker_history(ticker)
-            
-        data = resp.json()
-        if "results" not in data: return []
-            
-        records = []
-        for bar in data["results"]:
-            date_str = datetime.fromtimestamp(bar["t"] / 1000).strftime('%Y-%m-%d')
-            records.append({
-                "ticker": ticker,
-                "date": date_str,
-                "open": bar.get("o"),
-                "high": bar.get("h"),
-                "low": bar.get("l"),
-                "close": bar.get("c"),
-                "volume": bar.get("v")
-            })
-        return records
-
-    except Exception as e:
-        print(f" ❌ Error fetching {ticker}: {e}")
+    resp = requests.get(url, timeout=15)
+    
+    # Raise exception for 429 so @retry catches it
+    if resp.status_code == 429:
+        raise Exception("Rate Limited")
+        
+    if resp.status_code != 200:
+        print(f" ❌ Error fetching {ticker}: {resp.status_code}")
         return []
+        
+    data = resp.json()
+    if "results" not in data: return []
+        
+    records = []
+    for bar in data["results"]:
+        date_str = datetime.fromtimestamp(bar["t"] / 1000).strftime('%Y-%m-%d')
+        records.append({
+            "ticker": ticker,
+            "date": date_str,
+            "open": bar.get("o"),
+            "high": bar.get("h"),
+            "low": bar.get("l"),
+            "close": bar.get("c"),
+            "volume": bar.get("v")
+        })
+    return records
 
 # --- PART 2: NEWS ARCHIVE ---
 
@@ -132,7 +132,6 @@ def backfill_news():
             
             print(f"  ... fetched page of {len(articles)} articles. Processing...")
             
-            # Process in small sub-batches to save progress
             sub_batch_size = 10
             for i in range(0, len(articles), sub_batch_size):
                 chunk = articles[i:i + sub_batch_size]
@@ -158,10 +157,12 @@ def backfill_news():
                             "related_tickers": article.get("tickers", []) 
                         }
                         
+                        # FIX 3: REMOVED ignore_duplicates=True
+                        # We must allow the update to happen so Supabase returns the 'id'.
+                        # If we ignore duplicates, 'res.data' is empty and the script crashes.
                         res = supabase.table("news_vectors").upsert(
                             {k:v for k,v in news_item.items() if k!="related_tickers"}, 
-                            on_conflict="url",
-                            ignore_duplicates=True
+                            on_conflict="url"
                         ).execute()
                         
                         if res.data:
@@ -175,10 +176,11 @@ def backfill_news():
                                 })
                                 
                     except Exception as e:
-                        pass # Skip bad articles
+                        print(f"Skipping article: {e}")
 
                 if batch_edges:
                     try:
+                        # Graph edges CAN ignore duplicates because we don't need a return value
                         supabase.table("knowledge_graph").upsert(
                             batch_edges, on_conflict="source_node,target_node,edge_type", ignore_duplicates=True
                         ).execute()
@@ -208,12 +210,17 @@ if __name__ == "__main__":
     print(f"🚀 Backfilling STOCKS for {len(TICKER_UNIVERSE)} tickers...")
     all_stock_records = []
     
+    # Using 'executor.map' or manual submission is fine. Manual allows us to count progress easier.
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         future_to_ticker = {executor.submit(fetch_ticker_history, t): t for t in TICKER_UNIVERSE}
         completed = 0
         for future in concurrent.futures.as_completed(future_to_ticker):
-            data = future.result()
-            if data: all_stock_records.extend(data)
+            try:
+                data = future.result()
+                if data: all_stock_records.extend(data)
+            except Exception as e:
+                print(f"Worker Error: {e}")
+                
             completed += 1
             if completed % 50 == 0: print(f"  ... {completed}/{len(TICKER_UNIVERSE)} tickers fetched.")
 
