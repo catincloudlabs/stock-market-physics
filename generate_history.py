@@ -12,9 +12,9 @@ import httpx
 # 1. SETUP
 load_dotenv()
 
-# FIX: Explicitly increase timeouts for the HTTP client
-timeout_config = httpx.Timeout(60.0, connect=10.0, read=60.0)
-opts = ClientOptions(postgrest_client_timeout=60)
+# Increase timeouts significantly for heavy days
+timeout_config = httpx.Timeout(120.0, connect=10.0, read=120.0)
+opts = ClientOptions(postgrest_client_timeout=120)
 
 supabase: Client = create_client(
     os.getenv("SUPABASE_URL"), 
@@ -31,38 +31,36 @@ PERPLEXITY = 30
 def fetch_daily_vectors_rpc(target_date):
     """
     Fetches daily averages using Server-Side Paging.
-    Page size reduced to 25 to ensure rapid response times.
     """
     all_records = []
     page = 0
-    page_size = 25 # Smaller chunks to prevent socket hangs
+    page_size = 100 # Increased to 100 since we fixed the DB duplicates
     
     while True:
         try:
-            # Call the Paginated RPC
             resp = supabase.rpc("get_daily_market_vectors", {
                 "target_date": target_date,
                 "page_size": page_size,
                 "page_num": page
             }).execute()
             
-            # If no data returned, we are done
             if not resp.data:
                 break
                 
-            # Process this batch
             for item in resp.data:
                 vec = item['vector']
-                # Handle different return formats (string vs list)
+                # Parse JSON string if needed
                 if isinstance(vec, str):
                     vec = json.loads(vec)
                 
+                # Explicitly cast to float32 to be memory efficient
+                vec_np = np.array(vec, dtype=np.float32)
+                
                 all_records.append({
                     "ticker": item['ticker'],
-                    "vector": np.array(vec)
+                    "vector": vec_np
                 })
             
-            # If we got fewer rows than the page size, it's the last page
             if len(resp.data) < page_size:
                 break
                 
@@ -71,7 +69,8 @@ def fetch_daily_vectors_rpc(target_date):
         except Exception as e:
             print(f"    ⚠️ Error on page {page}: {e}")
             raise e
-            
+    
+    # Fast DataFrame construction
     return pd.DataFrame(all_records)
 
 # --- MAIN EXECUTION ---
@@ -79,7 +78,7 @@ def fetch_daily_vectors_rpc(target_date):
 if __name__ == "__main__":
     print(f"🚀 Starting Walk-Forward Generation (Last {HISTORY_DAYS} Days)...")
     
-    # 1. Generate Date List (Oldest to Newest)
+    # 1. Generate Date List
     end_date = datetime.now()
     dates = [(end_date - timedelta(days=i)).strftime('%Y-%m-%d') for i in range(HISTORY_DAYS)]
     dates.reverse() 
@@ -104,7 +103,7 @@ if __name__ == "__main__":
         print(f"✅ Found {len(df)} tickers.")
             
         # Prepare Matrix
-        if len(df) < PERPLEXITY + 1:
+        if len(df) < 5: # Need at least a few points for TSNE
             print(f"   ⚠️ Not enough data points ({len(df)}) for t-SNE.")
             continue
             
@@ -114,15 +113,15 @@ if __name__ == "__main__":
         n_samples = matrix.shape[0]
         init_matrix = None
         
+        # Walk-Forward: Use yesterday's positions as starting point for today
+        # This creates the "physics" animation effect
         if previous_positions is not None:
             init_build = []
-            
             for t in df['ticker']:
                 if t in previous_positions:
                     init_build.append(previous_positions[t])
                 else:
                     init_build.append(np.random.rand(2)) 
-            
             init_matrix = np.array(init_build)
             
         tsne = TSNE(
@@ -142,10 +141,8 @@ if __name__ == "__main__":
             ticker = row['ticker']
             x, y = embeddings[i]
             
-            # Store for next iteration
             day_map[ticker] = [x, y]
             
-            # Add to export list
             full_history.append({
                 "date": date_str,
                 "ticker": ticker,
