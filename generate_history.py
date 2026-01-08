@@ -1,3 +1,4 @@
+# Save as generate_history.py
 import os
 import json
 import pandas as pd
@@ -34,7 +35,7 @@ def fetch_daily_vectors_rpc(target_date):
     """
     all_records = []
     page = 0
-    page_size = 100 # Increased to 100 since we fixed the DB duplicates
+    page_size = 100 # Optimized for the new index speed
     
     while True:
         try:
@@ -49,7 +50,7 @@ def fetch_daily_vectors_rpc(target_date):
                 
             for item in resp.data:
                 vec = item['vector']
-                # Parse JSON string if needed
+                # Parse JSON string if needed (PostgREST quirk)
                 if isinstance(vec, str):
                     vec = json.loads(vec)
                 
@@ -70,7 +71,6 @@ def fetch_daily_vectors_rpc(target_date):
             print(f"    ⚠️ Error on page {page}: {e}")
             raise e
     
-    # Fast DataFrame construction
     return pd.DataFrame(all_records)
 
 # --- MAIN EXECUTION ---
@@ -103,7 +103,7 @@ if __name__ == "__main__":
         print(f"✅ Found {len(df)} tickers.")
             
         # Prepare Matrix
-        if len(df) < 5: # Need at least a few points for TSNE
+        if len(df) < 5: 
             print(f"   ⚠️ Not enough data points ({len(df)}) for t-SNE.")
             continue
             
@@ -113,14 +113,14 @@ if __name__ == "__main__":
         n_samples = matrix.shape[0]
         init_matrix = None
         
-        # Walk-Forward: Use yesterday's positions as starting point for today
-        # This creates the "physics" animation effect
+        # Walk-Forward: Use yesterday's positions as initialization for today
         if previous_positions is not None:
             init_build = []
             for t in df['ticker']:
                 if t in previous_positions:
                     init_build.append(previous_positions[t])
                 else:
+                    # New ticker entered the chat? Start it random.
                     init_build.append(np.random.rand(2)) 
             init_matrix = np.array(init_build)
             
