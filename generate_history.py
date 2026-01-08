@@ -14,20 +14,19 @@ supabase: Client = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_
 
 # CONFIG
 HISTORY_DAYS = 30
-PERPLEXITY = 30  # Tuning parameter for t-SNE (5-50)
+PERPLEXITY = 30  
 
 # --- RETRY LOGIC FOR DB ---
 @retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=4, max=10))
 def fetch_daily_vectors_safe(target_date):
     """
     Fetches news vectors for a specific date and averages them by ticker.
-    Retries automatically on network/timeout errors.
+    Handles Int vs String ID mismatch manually.
     """
-    # Time range: The whole day
     start = f"{target_date} 00:00:00"
     end = f"{target_date} 23:59:59"
     
-    # A. Get News Vectors
+    # A. Get News Vectors (IDs are Integers)
     news_resp = supabase.table("news_vectors") \
         .select("id, embedding") \
         .gte("published_at", start) \
@@ -37,15 +36,21 @@ def fetch_daily_vectors_safe(target_date):
     if not news_resp.data:
         return None
         
-    news_map = {item['id']: np.array(item['embedding']) for item in news_resp.data}
-    news_ids = list(news_map.keys())
+    # Map: Integer ID -> Vector
+    news_map_int = {item['id']: np.array(item['embedding']) for item in news_resp.data}
     
-    # B. Get Edges (News -> Ticker)
-    # Note: If this list is huge (>10k), we might need chunking, 
-    # but for daily news volume it usually holds.
+    # Convert Integers to Strings for Graph Query
+    news_ids_str = [str(nid) for nid in news_map_int.keys()]
+    
+    if not news_ids_str:
+        return None
+
+    # B. Get Edges (News -> Ticker) using String IDs
+    # Note: Supabase 'in_' filter expects a list of values matching the column type.
+    # Knowledge Graph 'source_node' is text/string.
     edges_resp = supabase.table("knowledge_graph") \
         .select("source_node, target_node") \
-        .in_("source_node", news_ids) \
+        .in_("source_node", news_ids_str) \
         .eq("edge_type", "MENTIONS") \
         .execute()
         
@@ -57,22 +62,22 @@ def fetch_daily_vectors_safe(target_date):
     
     for edge in edges_resp.data:
         ticker = edge['target_node']
-        # Supabase IDs are often strings in JSON, ensure type match
-        try:
-            news_id = int(edge['source_node']) 
-        except:
-            news_id = edge['source_node'] # Fallback if UUID
+        source_id_str = edge['source_node'] # This is a string
         
-        if news_id in news_map:
-            if ticker not in ticker_vectors:
-                ticker_vectors[ticker] = []
-            ticker_vectors[ticker].append(news_map[news_id])
+        # Convert string back to int to look up the vector
+        try:
+            source_id_int = int(source_id_str)
+            if source_id_int in news_map_int:
+                if ticker not in ticker_vectors:
+                    ticker_vectors[ticker] = []
+                ticker_vectors[ticker].append(news_map_int[source_id_int])
+        except ValueError:
+            continue
     
     # D. Average them (Centroid)
     final_data = []
     for ticker, vectors in ticker_vectors.items():
         if len(vectors) > 0:
-            # Mean vector of all news mentioning this stock today
             centroid = np.mean(vectors, axis=0)
             final_data.append({
                 "ticker": ticker,
@@ -86,13 +91,13 @@ def fetch_daily_vectors_safe(target_date):
 if __name__ == "__main__":
     print(f"🚀 Starting Walk-Forward Generation (Last {HISTORY_DAYS} Days)...")
     
-    # 1. Generate Date List
+    # 1. Generate Date List (Oldest to Newest)
     end_date = datetime.now()
     dates = [(end_date - timedelta(days=i)).strftime('%Y-%m-%d') for i in range(HISTORY_DAYS)]
-    dates.reverse() # Process oldest to newest!
+    dates.reverse() 
     
     full_history = []
-    previous_positions = None # The anchor for walk-forward
+    previous_positions = None 
     
     # 2. Iterate Through Time
     for date_str in dates:
@@ -101,7 +106,7 @@ if __name__ == "__main__":
         try:
             df = fetch_daily_vectors_safe(date_str)
         except Exception as e:
-            print(f"   ❌ Failed to fetch {date_str} after retries: {e}")
+            print(f"   ❌ Failed to fetch {date_str}: {e}")
             continue
         
         if df is None or df.empty:
@@ -109,7 +114,6 @@ if __name__ == "__main__":
             continue
             
         # Prepare Matrix
-        # Ensure we have enough data for t-SNE (needs > perplexity samples)
         if len(df) < PERPLEXITY + 1:
             print(f"   ⚠️ Not enough data points ({len(df)}) for t-SNE.")
             continue
@@ -121,21 +125,16 @@ if __name__ == "__main__":
         init_matrix = None
         
         if previous_positions is not None:
-            # We need to map yesterday's coordinates to today's tickers.
             init_build = []
-            random_count = 0
             
             for t in df['ticker']:
                 if t in previous_positions:
                     init_build.append(previous_positions[t])
                 else:
-                    # New ticker today? Initialize randomly
                     init_build.append(np.random.rand(2)) 
-                    random_count += 1
             
             init_matrix = np.array(init_build)
             
-        # Run Algorithm
         tsne = TSNE(
             n_components=2, 
             perplexity=min(PERPLEXITY, n_samples - 1), 
