@@ -6,6 +6,7 @@ from sklearn.manifold import TSNE
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from supabase import create_client, Client
+from tenacity import retry, stop_after_attempt, wait_exponential
 
 # 1. SETUP
 load_dotenv()
@@ -15,74 +16,70 @@ supabase: Client = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_
 HISTORY_DAYS = 30
 PERPLEXITY = 30  # Tuning parameter for t-SNE (5-50)
 
-def fetch_daily_vectors(target_date):
+# --- RETRY LOGIC FOR DB ---
+@retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=4, max=10))
+def fetch_daily_vectors_safe(target_date):
     """
     Fetches news vectors for a specific date and averages them by ticker.
-    Returns: DataFrame [ticker, vector_array]
+    Retries automatically on network/timeout errors.
     """
-    # 1. Get News IDs for the date
-    # Note: In a real prod environment, you'd likely have a materialized view for this.
-    # For now, we query raw tables.
-    
-    print(f"  ... fetching news for {target_date}")
-    
     # Time range: The whole day
     start = f"{target_date} 00:00:00"
     end = f"{target_date} 23:59:59"
     
-    try:
-        # A. Get News Vectors
-        news_resp = supabase.table("news_vectors") \
-            .select("id, embedding") \
-            .gte("published_at", start) \
-            .lte("published_at", end) \
-            .execute()
-            
-        if not news_resp.data:
-            return None
-            
-        news_map = {item['id']: np.array(item['embedding']) for item in news_resp.data}
-        news_ids = list(news_map.keys())
+    # A. Get News Vectors
+    news_resp = supabase.table("news_vectors") \
+        .select("id, embedding") \
+        .gte("published_at", start) \
+        .lte("published_at", end) \
+        .execute()
         
-        # B. Get Edges (News -> Ticker)
-        # We process in chunks if needed, but for daily volume this usually fits
-        edges_resp = supabase.table("knowledge_graph") \
-            .select("source_node, target_node") \
-            .in_("source_node", news_ids) \
-            .eq("edge_type", "MENTIONS") \
-            .execute()
-            
-        if not edges_resp.data:
-            return None
-
-        # C. Aggregate Vectors by Ticker
-        ticker_vectors = {}
-        
-        for edge in edges_resp.data:
-            ticker = edge['target_node']
-            news_id = int(edge['source_node']) # Ensure ID type matches
-            
-            if news_id in news_map:
-                if ticker not in ticker_vectors:
-                    ticker_vectors[ticker] = []
-                ticker_vectors[ticker].append(news_map[news_id])
-        
-        # D. Average them (Centroid)
-        final_data = []
-        for ticker, vectors in ticker_vectors.items():
-            if len(vectors) > 0:
-                # Mean vector of all news mentioning this stock today
-                centroid = np.mean(vectors, axis=0)
-                final_data.append({
-                    "ticker": ticker,
-                    "vector": centroid
-                })
-                
-        return pd.DataFrame(final_data)
-
-    except Exception as e:
-        print(f"Error fetching day {target_date}: {e}")
+    if not news_resp.data:
         return None
+        
+    news_map = {item['id']: np.array(item['embedding']) for item in news_resp.data}
+    news_ids = list(news_map.keys())
+    
+    # B. Get Edges (News -> Ticker)
+    # Note: If this list is huge (>10k), we might need chunking, 
+    # but for daily news volume it usually holds.
+    edges_resp = supabase.table("knowledge_graph") \
+        .select("source_node, target_node") \
+        .in_("source_node", news_ids) \
+        .eq("edge_type", "MENTIONS") \
+        .execute()
+        
+    if not edges_resp.data:
+        return None
+
+    # C. Aggregate Vectors by Ticker
+    ticker_vectors = {}
+    
+    for edge in edges_resp.data:
+        ticker = edge['target_node']
+        # Supabase IDs are often strings in JSON, ensure type match
+        try:
+            news_id = int(edge['source_node']) 
+        except:
+            news_id = edge['source_node'] # Fallback if UUID
+        
+        if news_id in news_map:
+            if ticker not in ticker_vectors:
+                ticker_vectors[ticker] = []
+            ticker_vectors[ticker].append(news_map[news_id])
+    
+    # D. Average them (Centroid)
+    final_data = []
+    for ticker, vectors in ticker_vectors.items():
+        if len(vectors) > 0:
+            # Mean vector of all news mentioning this stock today
+            centroid = np.mean(vectors, axis=0)
+            final_data.append({
+                "ticker": ticker,
+                "vector": centroid
+            })
+            
+    return pd.DataFrame(final_data)
 
 # --- MAIN EXECUTION ---
 
@@ -101,7 +98,11 @@ if __name__ == "__main__":
     for date_str in dates:
         print(f"📅 Processing {date_str}...")
         
-        df = fetch_daily_vectors(date_str)
+        try:
+            df = fetch_daily_vectors_safe(date_str)
+        except Exception as e:
+            print(f"   ❌ Failed to fetch {date_str} after retries: {e}")
+            continue
         
         if df is None or df.empty:
             print("   ⚠️ No data found (weekend/holiday?), skipping.")
@@ -116,17 +117,11 @@ if __name__ == "__main__":
         matrix = np.stack(df['vector'].values)
         
         # 3. RUN t-SNE (WALK-FORWARD)
-        # Initialization Logic:
-        # If we have previous positions for these specific tickers, use them.
-        # Otherwise, random init.
-        
         n_samples = matrix.shape[0]
         init_matrix = None
         
         if previous_positions is not None:
             # We need to map yesterday's coordinates to today's tickers.
-            # Tickers appear/disappear based on news flow.
-            
             init_build = []
             random_count = 0
             
@@ -139,11 +134,8 @@ if __name__ == "__main__":
                     random_count += 1
             
             init_matrix = np.array(init_build)
-            # Normalize init range to help t-SNE
-            # init_matrix = init_matrix * 0.0001 
             
         # Run Algorithm
-        # Note: 'init' parameter supports array
         tsne = TSNE(
             n_components=2, 
             perplexity=min(PERPLEXITY, n_samples - 1), 
@@ -170,7 +162,6 @@ if __name__ == "__main__":
                 "ticker": ticker,
                 "x": round(float(x), 2),
                 "y": round(float(y), 2),
-                # Optional: Add cluster label logic here later
                 "label": "News"
             })
             
