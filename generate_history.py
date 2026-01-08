@@ -5,12 +5,19 @@ import numpy as np
 from sklearn.manifold import TSNE
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
-from supabase import create_client, Client
+from supabase import create_client, Client, ClientOptions
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 # 1. SETUP
 load_dotenv()
-supabase: Client = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_SERVICE_KEY"))
+
+# INCREASE TIMEOUT: Give the DB more time to think (60 seconds)
+opts = ClientOptions(postgrest_client_timeout=60)
+supabase: Client = create_client(
+    os.getenv("SUPABASE_URL"), 
+    os.getenv("SUPABASE_SERVICE_KEY"),
+    options=opts
+)
 
 # CONFIG
 HISTORY_DAYS = 30
@@ -20,35 +27,48 @@ PERPLEXITY = 30
 @retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=2, max=10))
 def fetch_daily_vectors_rpc(target_date):
     """
-    Calls the server-side Postgres function to get daily averages.
-    This is FAST because no heavy data is transferred over the network.
+    Fetches daily averages using Server-Side Paging.
+    This prevents timeouts by fetching 100 tickers at a time.
     """
-    try:
-        # Call the RPC function we just created
-        resp = supabase.rpc("get_daily_market_vectors", {"target_date": target_date}).execute()
-        
-        if not resp.data:
-            return None
+    all_records = []
+    page = 0
+    page_size = 100
+    
+    while True:
+        try:
+            # Call the Paginated RPC
+            resp = supabase.rpc("get_daily_market_vectors", {
+                "target_date": target_date,
+                "page_size": page_size,
+                "page_num": page
+            }).execute()
             
-        # The data comes back already aggregated: [{'ticker': 'AAPL', 'vector': [...]}, ...]
-        # We just need to convert the vector string/list to numpy
-        cleaned_data = []
-        for item in resp.data:
-            # Supabase might return the vector as a string or list depending on the driver version
-            vec = item['vector']
-            if isinstance(vec, str):
-                vec = json.loads(vec)
+            # If no data returned, we are done
+            if not resp.data:
+                break
+                
+            # Process this batch
+            for item in resp.data:
+                vec = item['vector']
+                if isinstance(vec, str):
+                    vec = json.loads(vec)
+                
+                all_records.append({
+                    "ticker": item['ticker'],
+                    "vector": np.array(vec)
+                })
             
-            cleaned_data.append({
-                "ticker": item['ticker'],
-                "vector": np.array(vec)
-            })
+            # If we got fewer rows than the page size, it's the last page
+            if len(resp.data) < page_size:
+                break
+                
+            page += 1
             
-        return pd.DataFrame(cleaned_data)
-        
-    except Exception as e:
-        print(f"    ⚠️ RPC Error: {e}")
-        raise e
+        except Exception as e:
+            print(f"    ⚠️ Error on page {page}: {e}")
+            raise e
+            
+    return pd.DataFrame(all_records)
 
 # --- MAIN EXECUTION ---
 
@@ -65,7 +85,7 @@ if __name__ == "__main__":
     
     # 2. Iterate Through Time
     for date_str in dates:
-        print(f"📅 Processing {date_str}...", end=" ")
+        print(f"📅 Processing {date_str}...", end=" ", flush=True)
         
         try:
             df = fetch_daily_vectors_rpc(date_str)
