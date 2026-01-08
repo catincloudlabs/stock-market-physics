@@ -123,12 +123,11 @@ if __name__ == "__main__":
                     # New ticker entered the chat? Start it random.
                     init_build.append(np.random.rand(2)) 
             init_matrix = np.array(init_build)
-            
+
+        # We rely on defaults (usually n_iter=1000, learning_rate='auto')
         tsne = TSNE(
             n_components=2, 
             perplexity=min(PERPLEXITY, n_samples - 1), 
-            n_iter=500, 
-            learning_rate=100,
             init=init_matrix if init_matrix is not None else 'pca',
             random_state=42
         )
