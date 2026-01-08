@@ -60,3 +60,24 @@ begin
   order by rn.similarity desc;
 end;
 $$;
+
+
+-- 1. Fix the Particles (Stocks)
+-- You were missing Open, High, and Low
+alter table stocks_ohlc 
+add column if not exists open numeric,
+add column if not exists high numeric,
+add column if not exists low numeric;
+
+-- 2. Fix the Fields (News)
+-- You were missing the URL (which you use for conflict detection)
+alter table news_vectors 
+add column if not exists url text;
+
+-- 3. Add the Constraint for News
+-- Your script uses 'on_conflict="url"', so the DB needs a unique index on it
+alter table news_vectors 
+add constraint news_vectors_url_key unique (url);
+
+-- 4. Reload the API Schema Cache (Just in case)
+NOTIFY pgrst, 'reload schema';

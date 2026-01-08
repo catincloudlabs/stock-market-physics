@@ -21,12 +21,13 @@ PERPLEXITY = 30
 def fetch_daily_vectors_safe(target_date):
     """
     Fetches news vectors for a specific date and averages them by ticker.
-    Handles Int vs String ID mismatch manually.
+    Includes BATCHING to prevent URL overflow errors on large datasets.
     """
     start = f"{target_date} 00:00:00"
     end = f"{target_date} 23:59:59"
     
     # A. Get News Vectors (IDs are Integers)
+    # This usually returns fine even with large ranges
     news_resp = supabase.table("news_vectors") \
         .select("id, embedding") \
         .gte("published_at", start) \
@@ -45,24 +46,39 @@ def fetch_daily_vectors_safe(target_date):
     if not news_ids_str:
         return None
 
-    # B. Get Edges (News -> Ticker) using String IDs
-    # Note: Supabase 'in_' filter expects a list of values matching the column type.
-    # Knowledge Graph 'source_node' is text/string.
-    edges_resp = supabase.table("knowledge_graph") \
-        .select("source_node, target_node") \
-        .in_("source_node", news_ids_str) \
-        .eq("edge_type", "MENTIONS") \
-        .execute()
+    # B. Get Edges (News -> Ticker) - BATCHED
+    # We chunk the IDs to avoid "URI Too Long" errors / Socket timeouts
+    BATCH_SIZE = 50 
+    all_edges = []
+    
+    # Iterate in chunks
+    for i in range(0, len(news_ids_str), BATCH_SIZE):
+        batch_ids = news_ids_str[i : i + BATCH_SIZE]
         
-    if not edges_resp.data:
+        try:
+            # Supabase 'in_' filter works best with smaller lists
+            edges_resp = supabase.table("knowledge_graph") \
+                .select("source_node, target_node") \
+                .in_("source_node", batch_ids) \
+                .eq("edge_type", "MENTIONS") \
+                .execute()
+            
+            if edges_resp.data:
+                all_edges.extend(edges_resp.data)
+                
+        except Exception as e:
+            print(f"    ⚠️ Batch fetch error (skipping chunk): {e}")
+            continue
+
+    if not all_edges:
         return None
 
     # C. Aggregate Vectors by Ticker
     ticker_vectors = {}
     
-    for edge in edges_resp.data:
+    for edge in all_edges:
         ticker = edge['target_node']
-        source_id_str = edge['source_node'] # This is a string
+        source_id_str = edge['source_node'] # This is a string from DB
         
         # Convert string back to int to look up the vector
         try:
