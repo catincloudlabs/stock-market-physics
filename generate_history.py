@@ -9,11 +9,12 @@ from supabase import create_client, Client, ClientOptions
 from tenacity import retry, stop_after_attempt, wait_exponential
 import httpx
 from textblob import TextBlob
+import inspect
 
 # 1. SETUP
 load_dotenv()
 
-# Modern timeout configuration for reliability
+# Increase timeouts significantly for heavy days
 timeout_config = httpx.Timeout(120.0, connect=10.0, read=120.0)
 opts = ClientOptions(postgrest_client_timeout=120)
 
@@ -28,53 +29,66 @@ HISTORY_DAYS = 30
 PERPLEXITY = 30  
 
 # --- MATH UTILS: Procrustes Alignment ---
-# This mathematically "locks" today's chart to yesterday's orientation.
 def align_to_reference(source_matrix, target_matrix, source_tickers, target_tickers):
     """
     Rotates, scales, and translates 'target_matrix' (Today) to best fit 'source_matrix' (Yesterday).
-    This stabilizes the chart so tickers don't fly around randomly due to t-SNE rotation.
+    This stabilizes the chart so tickers don't fly around randomly.
     """
-    # 1. Identify Anchors (Tickers present in both days)
     common_tickers = list(set(source_tickers) & set(target_tickers))
     
     if len(common_tickers) < 3:
-        # Not enough points to lock orientation, return original
         return target_matrix
 
-    # 2. Extract Anchor Points
     src_indices = [source_tickers.index(t) for t in common_tickers]
     tgt_indices = [target_tickers.index(t) for t in common_tickers]
     
-    A = source_matrix[src_indices] # Yesterday (Reference)
-    B = target_matrix[tgt_indices] # Today (Target)
+    A = source_matrix[src_indices]
+    B = target_matrix[tgt_indices]
 
-    # 3. Center the data
     centroid_A = np.mean(A, axis=0)
     centroid_B = np.mean(B, axis=0)
     AA = A - centroid_A
     BB = B - centroid_B
 
-    # 4. SVD for optimal rotation (Kabsch Algorithm)
-    # This finds the best rotation matrix R to minimize distance between AA and BB
     H = np.dot(BB.T, AA)
     U, S, Vt = np.linalg.svd(H)
     R = np.dot(Vt.T, U.T)
 
-    # Handle reflection case (ensure we don't accidentally "mirror" the chart)
     if np.linalg.det(R) < 0:
         Vt[1, :] *= -1
         R = np.dot(Vt.T, U.T)
 
-    # 5. Apply Transformation to ENTIRE target_matrix (Today)
-    # Move Today to origin -> Rotate -> Move to Yesterday's centroid
     return np.dot(target_matrix - centroid_B, R) + centroid_A
+
+# --- SENIOR DEV TRICK: Dynamic Argument Injection ---
+def create_tsne_instance(n_components, perplexity, init, random_state):
+    """
+    Dynamically inspects the installed TSNE class and only passes
+    supported arguments. This fixes version mismatch errors automatically.
+    """
+    # Desired parameters for a rigorous physics simulation
+    preferred_params = {
+        "n_components": n_components,
+        "perplexity": perplexity,
+        "init": init,
+        "random_state": random_state,
+        "learning_rate": "auto",
+        "n_iter": 1000,
+        "method": "barnes_hut"
+    }
+
+    # Inspect what the installed TSNE actually accepts
+    sig = inspect.signature(TSNE.__init__)
+    valid_args = set(sig.parameters.keys())
+
+    # Only keep arguments that exist in this version of sklearn
+    final_params = {k: v for k, v in preferred_params.items() if k in valid_args}
+    
+    return TSNE(**final_params)
 
 # --- DB FETCHING ---
 @retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=2, max=10))
 def fetch_daily_vectors_rpc(target_date):
-    """
-    Fetches daily averages using Server-Side Paging.
-    """
     all_records = []
     page = 0
     page_size = 100
@@ -92,14 +106,10 @@ def fetch_daily_vectors_rpc(target_date):
                 
             for item in resp.data:
                 vec = item['vector']
-                # Handle PostgREST stringification if present
                 if isinstance(vec, str):
                     vec = json.loads(vec)
-                
-                # Enforce float32 for consistency
                 vec_np = np.array(vec, dtype=np.float32)
                 
-                # Basic sentiment extraction
                 headline = item.get('headline', '')
                 sentiment = 0
                 if headline:
@@ -131,11 +141,9 @@ if __name__ == "__main__":
     
     end_date = datetime.now()
     dates = [(end_date - timedelta(days=i)).strftime('%Y-%m-%d') for i in range(HISTORY_DAYS)]
-    dates.reverse() # Process oldest to newest
+    dates.reverse() 
     
     full_history = []
-    
-    # State tracking for stabilization
     prev_matrix = None
     prev_tickers = None
     
@@ -152,7 +160,6 @@ if __name__ == "__main__":
             print("Skipped (No data)")
             continue
             
-        # Prepare Matrix
         current_matrix = np.stack(df['vector'].values)
         current_tickers = df['ticker'].tolist()
         
@@ -160,8 +167,7 @@ if __name__ == "__main__":
             print("Skipped (Not enough data)")
             continue
 
-        # 1. Initialization Hint (Soft Stabilization)
-        # We start the optimization where the points were yesterday.
+        # 1. Initialization Hint
         n_samples = current_matrix.shape[0]
         init_matrix = None
         
@@ -172,26 +178,20 @@ if __name__ == "__main__":
                 if t in prev_map:
                     init_build.append(prev_map[t])
                 else:
-                    # New ticker? Start it random.
                     init_build.append(np.random.rand(2)) 
             init_matrix = np.array(init_build)
             
-        # 2. Run t-SNE (Rigorous Configuration)
-        # Using exact parameters ensures reproducibility.
-        tsne = TSNE(
-            n_components=2, 
-            perplexity=min(PERPLEXITY, n_samples - 1), 
+        # 2. Run TSNE (Adaptive)
+        tsne = create_tsne_instance(
+            n_components=2,
+            perplexity=min(PERPLEXITY, n_samples - 1),
             init=init_matrix if init_matrix is not None else 'pca',
-            learning_rate='auto',
-            n_iter=1000,     # Explicitly set iterations for stability
-            random_state=42, # Lock random seed
-            method='barnes_hut'
+            random_state=42
         )
         
         embeddings_raw = tsne.fit_transform(current_matrix)
         
-        # 3. Apply Procrustes Alignment (Hard Stabilization)
-        # This mathematically rotates today's map to align with yesterday's map.
+        # 3. Apply Procrustes Alignment (Physics Lock)
         if prev_matrix is not None:
             embeddings_stabilized = align_to_reference(
                 source_matrix=prev_matrix, 
@@ -200,10 +200,9 @@ if __name__ == "__main__":
                 target_tickers=current_tickers
             )
         else:
-            # First day defines the coordinate system
             embeddings_stabilized = embeddings_raw
             
-        # 4. Save & Update State
+        # 4. Save
         for i, row in df.iterrows():
             ticker = row['ticker']
             x, y = embeddings_stabilized[i]
@@ -217,13 +216,12 @@ if __name__ == "__main__":
                 "sentiment": round(row['sentiment'], 2)
             })
             
-        # Update references for the next iteration
         prev_matrix = embeddings_stabilized
         prev_tickers = current_tickers
         
         print(f"✅ Aligned & Saved ({len(df)} tickers)")
 
-    # 5. EXPORT
+    # 5. Export
     output_path = "market_physics_history.json"
     with open(output_path, "w") as f:
         json.dump({"data": full_history}, f)
