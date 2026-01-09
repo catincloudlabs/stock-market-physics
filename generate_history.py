@@ -1,4 +1,3 @@
-# Save as generate_history.py
 import os
 import json
 import pandas as pd
@@ -9,6 +8,7 @@ from dotenv import load_dotenv
 from supabase import create_client, Client, ClientOptions
 from tenacity import retry, stop_after_attempt, wait_exponential
 import httpx
+from textblob import TextBlob
 
 # 1. SETUP
 load_dotenv()
@@ -32,13 +32,15 @@ PERPLEXITY = 30
 def fetch_daily_vectors_rpc(target_date):
     """
     Fetches daily averages using Server-Side Paging.
+    Now includes HEADLINE fetching.
     """
     all_records = []
     page = 0
-    page_size = 100 # Optimized for the new index speed
+    page_size = 100
     
     while True:
         try:
+            # Call the Paginated RPC
             resp = supabase.rpc("get_daily_market_vectors", {
                 "target_date": target_date,
                 "page_size": page_size,
@@ -57,9 +59,21 @@ def fetch_daily_vectors_rpc(target_date):
                 # Explicitly cast to float32 to be memory efficient
                 vec_np = np.array(vec, dtype=np.float32)
                 
+                # --- SENTIMENT ANALYSIS ---
+                headline = item.get('headline', '')
+                sentiment = 0
+                if headline:
+                    try:
+                        sentiment = TextBlob(headline).sentiment.polarity
+                    except:
+                        sentiment = 0
+                # --------------------------
+                
                 all_records.append({
                     "ticker": item['ticker'],
-                    "vector": vec_np
+                    "vector": vec_np,
+                    "headline": headline,    # Add Headline
+                    "sentiment": sentiment   # Add Sentiment Score
                 })
             
             if len(resp.data) < page_size:
@@ -123,8 +137,8 @@ if __name__ == "__main__":
                     # New ticker entered the chat? Start it random.
                     init_build.append(np.random.rand(2)) 
             init_matrix = np.array(init_build)
-
-        # We rely on defaults (usually n_iter=1000, learning_rate='auto')
+            
+        # Run t-SNE
         tsne = TSNE(
             n_components=2, 
             perplexity=min(PERPLEXITY, n_samples - 1), 
@@ -147,7 +161,8 @@ if __name__ == "__main__":
                 "ticker": ticker,
                 "x": round(float(x), 2),
                 "y": round(float(y), 2),
-                "label": "News"
+                "headline": row['headline'],   # EXPORT HEADLINE
+                "sentiment": round(row['sentiment'], 2)  # EXPORT SENTIMENT
             })
             
         previous_positions = day_map
